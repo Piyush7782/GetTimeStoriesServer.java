@@ -1,0 +1,156 @@
+import com.sun.net.httpserver.HttpExchange;
+import com.sun.net.httpserver.HttpHandler;
+import com.sun.net.httpserver.HttpServer;
+
+import java.io.*;
+import java.net.*;
+import java.nio.charset.StandardCharsets;
+import java.time.Instant;
+import java.util.*;
+import java.util.regex.*;
+
+public class GetTimeStoriesServer {
+
+    private static final String TIME_HOME = "https://time.com";
+
+    // Regex to capture <a href="...">Title</a>
+    private static final Pattern A_HREF_RE = Pattern.compile(
+            "<a\\b[^>]*href=\"([^\"]+)\"[^>]*>(.*?)</a>",
+            Pattern.CASE_INSENSITIVE | Pattern.DOTALL);
+
+    private static final Pattern ABS_ARTICLE = Pattern.compile(
+            "^https?://time\\.com/\\d{6,8}/[^/]+/?$", Pattern.CASE_INSENSITIVE);
+
+    private static final Pattern REL_ARTICLE = Pattern.compile(
+            "^/\\d{6,8}/[^/]+/?$", Pattern.CASE_INSENSITIVE);
+
+    private static final Pattern TAG_RE = Pattern.compile("<[^>]+>");
+
+
+
+    private static String stripTags(String text) {
+        return TAG_RE.matcher(text).replaceAll("");
+    }
+
+    private static String cleanTitle(String text) {
+        String t = stripTags(text);
+        t = org.apache.commons.text.StringEscapeUtils.unescapeHtml4(t); // optional
+        return t.trim().replaceAll("\\s+", " ");
+    }
+
+    private static String toAbsUrl(String href) {
+        if (href.startsWith("//")) return "https:" + href;
+        if (href.startsWith("http://") || href.startsWith("https://")) return href;
+        if (href.startsWith("/")) return TIME_HOME + href;
+        return TIME_HOME + "/" + href;
+    }
+
+    
+    private static String fetchHomepage() throws IOException {
+        URL url = new URL(TIME_HOME);
+        HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+        conn.setRequestProperty("User-Agent",
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64)");
+        conn.setConnectTimeout(10000);
+        conn.setReadTimeout(10000);
+
+        try (InputStream is = conn.getInputStream();
+             BufferedReader br = new BufferedReader(new InputStreamReader(is, StandardCharsets.UTF_8))) {
+            StringBuilder sb = new StringBuilder();
+            String line;
+            while ((line = br.readLine()) != null) sb.append(line).append("\n");
+            return sb.toString();
+        }
+    }
+
+    
+    private static List<Map<String, String>> extractLatestStories(String html, int maxItems) {
+        List<Map<String, String>> stories = new ArrayList<>();
+        Set<String> seen = new HashSet<>();
+
+        Matcher matcher = A_HREF_RE.matcher(html);
+        while (matcher.find() && stories.size() < maxItems) {
+            String href = matcher.group(1);
+            String titleHtml = matcher.group(2);
+
+            String absUrl = toAbsUrl(href);
+            if (!(ABS_ARTICLE.matcher(absUrl).matches() || REL_ARTICLE.matcher(href).matches()))
+                continue;
+
+            String title = cleanTitle(titleHtml);
+            if (title.length() < 3) continue;
+
+            if (!seen.contains(title)) {
+                seen.add(title);
+                Map<String, String> story = new LinkedHashMap<>();
+                story.put("title", title);
+                story.put("link", absUrl);
+                stories.add(story);
+            }
+        }
+        return stories;
+    }
+
+   
+    static class StoriesHandler implements HttpHandler {
+        @Override
+        public void handle(HttpExchange exchange) throws IOException {
+            String path = exchange.getRequestURI().getPath();
+            if ("/getTimeStories".equals(path)) {
+                try {
+                    String html = fetchHomepage();
+                    List<Map<String, String>> stories = extractLatestStories(html, 6);
+
+                    StringBuilder json = new StringBuilder();
+                    json.append("{\n");
+                    json.append("  \"source\": \"").append(TIME_HOME).append("\",\n");
+                    json.append("  \"count\": ").append(stories.size()).append(",\n");
+                    json.append("  \"fetched_at\": \"").append(Instant.now().toString()).append("\",\n");
+                    json.append("  \"stories\": [\n");
+
+                    for (int i = 0; i < stories.size(); i++) {
+                        Map<String, String> s = stories.get(i);
+                        json.append("    {\"title\": \"")
+                                .append(s.get("title").replace("\"", "\\\""))
+                                .append("\", \"link\": \"")
+                                .append(s.get("link"))
+                                .append("\"}");
+                        if (i < stories.size() - 1) json.append(",");
+                        json.append("\n");
+                    }
+                    json.append("  ]\n}");
+                    
+                    byte[] response = json.toString().getBytes(StandardCharsets.UTF_8);
+                    exchange.getResponseHeaders().set("Content-Type", "application/json; charset=utf-8");
+                    exchange.sendResponseHeaders(200, response.length);
+                    try (OutputStream os = exchange.getResponseBody()) {
+                        os.write(response);
+                    }
+                } catch (Exception e) {
+                    String err = "{\"error\":\"" + e.getMessage() + "\"}";
+                    byte[] response = err.getBytes(StandardCharsets.UTF_8);
+                    exchange.sendResponseHeaders(500, response.length);
+                    try (OutputStream os = exchange.getResponseBody()) {
+                        os.write(response);
+                    }
+                }
+            } else {
+                byte[] response = "{\"error\":\"Not Found\"}".getBytes(StandardCharsets.UTF_8);
+                exchange.sendResponseHeaders(404, response.length);
+                try (OutputStream os = exchange.getResponseBody()) {
+                    os.write(response);
+                }
+            }
+        }
+    }
+
+    
+    public static void main(String[] args) throws Exception {
+        int port = 8000;
+        HttpServer server = HttpServer.create(new InetSocketAddress(port), 0);
+        server.createContext("/getTimeStories", new StoriesHandler());
+        server.setExecutor(null);
+        System.out.println("Server running at http://localhost:" + port + "/getTimeStories");
+        server.start();
+    }
+}
